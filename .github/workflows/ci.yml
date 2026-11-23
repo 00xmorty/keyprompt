@@ -27,10 +27,17 @@ jobs:
 
       - name: Smoke run (text + JSON)
         run: |
-          set -e
+          # --only + Apple-signed binary must be clean (exit 0)
           ./keyprompt --only --no-service --service security
+          # Full scan: exit 1 is expected when an unstable consumer exists on the runner,
+          # so the status code is asserted separately from the payload.
+          set +e
           ./keyprompt --json --no-color > /tmp/keyprompt.json
-          python3 -c 'import json;d=json.load(open("/tmp/keyprompt.json"));assert d["read_only"] is True;print("json ok:",len(d["results"]),"records")'
+          scan_rc=$?
+          set -e
+          echo "full-scan exit code: $scan_rc (0=clean, 1=unstable consumer found)"
+          case "$scan_rc" in 0|1) ;; *) echo "unexpected exit code"; exit 1 ;; esac
+          python3 -c 'import json;d=json.load(open("/tmp/keyprompt.json"));assert d["read_only"] is True;assert isinstance(d["results"],list) and len(d["results"])>0;print("json ok:",len(d["results"]),"records")'
 
       - name: Ensure no secret-reading keychain flags
         run: |
