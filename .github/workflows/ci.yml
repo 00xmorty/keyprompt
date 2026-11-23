@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS test suite
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shell syntax
+        run: zsh -n keyprompt
+
+      - name: Built-in unit tests
+        run: ./keyprompt --self-test
+
+      - name: Full test suite
+        run: sh test/test_keyprompt.sh
+
+      - name: Smoke run (text + JSON)
+        run: |
+          set -e
+          ./keyprompt --only --no-service --service security
+          ./keyprompt --json --no-color > /tmp/keyprompt.json
+          python3 -c 'import json;d=json.load(open("/tmp/keyprompt.json"));assert d["read_only"] is True;print("json ok:",len(d["results"]),"records")'
+
+      - name: Ensure no secret-reading keychain flags
+        run: |
+          set -e
+          if sed -e 's/[[:space:]]*#.*$//' keyprompt | grep -Eq 'dump-keychain|security[^|]*-[a-zA-Z]*[gw]([[:space:]]|$)'; then
+            echo "forbidden keychain flag found"; exit 1
+          fi
+          echo "read-only guarantee holds"

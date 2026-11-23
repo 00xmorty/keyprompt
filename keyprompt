@@ -1,0 +1,325 @@
+#!/bin/zsh
+# keyprompt — read-only root-cause diagnosis for repeating macOS keychain password prompts.
+#
+# Why do you keep getting "X wants to use your confidential information stored in ..."?
+# The prompt returns when the app's signature identity drifts away from the partition
+# list stored on the keychain item. keyprompt reports which of the known causes applies
+# to each local binary, and prints the repair command WITHOUT running it.
+#
+# Guarantees:
+#   * read-only: no writes, no defaults changes, no keychain modifications
+#   * never asks for your password, never decrypts a secret (no `security -g`, no `dump-keychain`)
+#   * account names are masked unless you pass --show-account
+#
+# Licensed MIT. See README.md for scope and limitations.
+
+emulate -L zsh
+set -u
+setopt pipe_fail no_nomatch
+
+VERSION="0.1.0"
+MACOS_VER="$(sw_vers -productVersion 2>/dev/null || print 'unknown')"
+
+COLOR=0
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then COLOR=1; fi
+if (( COLOR )); then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RST=$'\033[0m'
+else
+  BOLD=""; DIM=""; RST=""
+fi
+
+err() { print -ru2 -- "keyprompt: $*" }
+die() { err "$1"; exit 2 }
+
+usage() {
+  cat <<'EOF'
+keyprompt v0.1.0 — why does macOS keep asking for my keychain password?
+
+USAGE
+  keyprompt [options]
+
+OPTIONS
+  --json              machine-readable output
+  --service BIN=SVC   add a custom binary/service pair (repeatable)
+  --no-service        skip keychain item probe (signature analysis only)
+  --only              ignore the built-in consumer list (use only --service)
+  --show-account      include keychain item account names (masked by default)
+  --no-color          disable ANSI colour
+  --explain           print the mechanism behind the verdicts
+  --self-test         run built-in parser/verdict tests and exit
+  --version           print version
+  -h, --help          this help
+
+EXIT CODES
+  0  diagnosis produced, no ad-hoc signed keychain consumer found
+  1  at least one consumer has an unstable (ad-hoc/unsigned) signature
+  2  usage or environment error
+
+SCOPE
+  Read-only. keyprompt never modifies keychain items, never asks for your
+  password and never decrypts stored secrets. It reports attributes and
+  signature classes only, so it cannot prove what the partition list of an
+  item currently contains — it reports the most likely cause from evidence
+  it is allowed to collect.
+EOF
+}
+
+# ---------------------------------------------------------------- signatures
+# Parse `codesign -dv --verbose=4` output from stdin into "CLASS|TEAM|IDENT".
+# CLASS: adhoc | developer-id | apple | unsigned
+sig_parse() {
+  local line ident="unknown" team="not set" kind="" authchain=""
+  while IFS= read -r line; do
+    case $line in
+      Identifier=*)                    ident=${line#Identifier=} ;;
+      Signature=adhoc*)                kind="adhoc" ;;
+      Authority=*)                 authchain+=" ${line#Authority=}" ;;
+      TeamIdentifier=*)                team=${line#TeamIdentifier=} ;;
+      *'code object is not signed at all'*|*'not signed at all'*)
+                                       kind="unsigned" ;;
+    esac
+  done
+
+  local class
+  if [[ $kind == "unsigned" ]]; then
+    class="unsigned"
+  elif [[ $kind == "adhoc" ]]; then
+    class="adhoc"
+  elif [[ $team != "not set" && -n $team ]]; then
+    class="developer-id"
+  elif [[ $authchain == *Apple* || $authchain == *"Software Signing"* ]]; then
+    class="apple"
+  else
+    class="unsigned"
+  fi
+  print -r -- "${class}|${team}|${ident}"
+}
+
+sig_of_path() {
+  local binp=$1
+  [[ -e $binp ]] || { print -r -- "missing|not set|$binp"; return }
+  codesign -dv --verbose=4 "$binp" 2>&1 | sig_parse
+}
+
+# ---------------------------------------------------------------- verdicts
+# verdict CLASS TEAM -> "STABILITY|CAUSE_KEY|ONE-LINE CAUSE"
+verdict() {
+  local class=$1 team=$2
+  case $class in
+    adhoc)
+      print -r -- "unstable|cdhash-drift|ad-hoc (linker-signed) binary: the partition list can only store this build's cdhash" ;;
+    unsigned)
+      print -r -- "unstable|unsigned|binary carries no code signature, so no stable identity exists to trust" ;;
+    developer-id)
+      print -r -- "stable|teamid-or-acl|signed by team ${team}: identity is stable, so a repeating prompt means a team-ID or ACL mismatch" ;;
+    apple)
+      print -r -- "stable|platform|Apple-signed component: prompts here are policy, not signature drift" ;;
+    *)
+      print -r -- "unknown|none|binary not found, nothing to diagnose" ;;
+  esac
+}
+
+fix_hint() {
+  local class=$1 team=$2 svc=$3
+  case $class in
+    adhoc|unsigned)
+      print -r -- "No stable repair exists for this binary. Rebuild/reinstall it with a Developer ID signature (team ID), or accept the prompt after each update. Forcing the item's partition list only buys time until the next rebuild."
+      ;;
+    developer-id)
+      print -r -- "If the prompt repeats, the item was last written by a different team. Verify the writer first, then (do NOT paste blindly): security set-generic-password-partition-list -S teamid:${team} -s ${svc} -a <account> -k"
+      ;;
+    *)
+      print -r -- "Nothing to repair for this entry."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------- keychain probe
+# Attributes only: no -g, no -w, no dump-keychain. Never triggers a password prompt.
+item_attrs() {
+  local svc=$1 out acct="" cdat=""
+  out=$(security find-generic-password -s "$svc" 2>/dev/null)
+  [[ -n $out ]] || { print -r -- "absent||"; return }
+  local SED_ACCT='s/.*"acct"<blob>="\(.*\)"$/\1/p'
+  local SED_CDAT='s/.*"cdat"<timedate>=0x[0-9A-Fa-f]* *"\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\).*/\1-\2-\3/p'
+  acct=$(print -r -- "$out" | sed -n "$SED_ACCT" | sed -n 1p)
+  cdat=$(print -r -- "$out" | sed -n "$SED_CDAT" | sed -n 1p)
+  print -r -- "present|${acct}|${cdat}"
+}
+
+mask() {
+  local s=$1
+  (( SHOW_ACCOUNT )) && { print -r -- "$s"; return }
+  if [[ -z $s ]]; then print -r -- ""; else print -r -- "***"; fi
+}
+
+# ---------------------------------------------------------------- defaults
+JSON=0
+EXPLAIN=0
+ONLY=0
+SELFTEST=0
+PROBE_ITEMS=1
+SHOW_ACCOUNT=0
+typeset -a EXTRA_PAIRS
+# binary|service|note  (publicly documented pairings; extend with --service)
+typeset -a PAIRS
+PAIRS=(
+  "gh|gh:github.com|GitHub CLI credential per host (gh auth login)"
+  "claude|Claude Code-credentials|Claude Code CLI OAuth credential"
+  "copilot|copilot-cli|GitHub Copilot CLI token"
+  "docker-credential-osxkeychain|docker-credential-osxkeychain|Docker registry credential helper"
+)
+
+# ---------------------------------------------------------------- self-test
+self_test() {
+  local fails=0
+  check() {
+    local name=$1 want=$2 got=$3
+    if [[ $got == $want ]]; then print -r -- "ok   $name"
+    else print -r -- "FAIL $name (want '$want', got '$got')"; fails=$((fails + 1)); fi
+  }
+  check "adhoc/linker-signed -> adhoc" "adhoc|not set|a.out" \
+    "$(print -r -- 'Identifier=a.out
+CodeDirectory v=20400 flags=0x20002(adhoc,linker-signed) hashes=8703
+Signature=adhoc
+TeamIdentifier=not set' | sig_parse)"
+  check "developer-id team kept" "developer-id|ABCD123456|com.example.tool" \
+    "$(print -r -- 'Identifier=com.example.tool
+Authority=Developer ID Application: Example Inc (ABCD123456)
+TeamIdentifier=ABCD123456' | sig_parse)"
+  check "apple platform" "apple|not set|com.apple.thing" \
+    "$(print -r -- 'Identifier=com.apple.thing
+Authority=Apple iPhone OS Application Signing
+TeamIdentifier=not set' | sig_parse)"
+  check "apple platform (software signing)" "apple|not set|com.apple.security" \
+    "$(print -r -- 'Identifier=com.apple.security
+Authority=macOS Software Signing
+Authority=Apple Code Signing Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=not set' | sig_parse)"
+  check "unsigned detection" "unsigned|not set|unknown" \
+    "$(print -r -- '/tmp/nope: code object is not signed at all' | sig_parse)"
+  check "verdict adhoc" "unstable|cdhash-drift|ad-hoc (linker-signed) binary: the partition list can only store this build's cdhash" \
+    "$(verdict adhoc 'not set')"
+  check "verdict devid" "stable|teamid-or-acl|signed by team T9Z: identity is stable, so a repeating prompt means a team-ID or ACL mismatch" \
+    "$(verdict developer-id T9Z)"
+  if (( fails )); then print -r -- "self-test: ${fails} failure(s)"; return 1; fi
+  print -r -- "self-test: all checks passed"
+  return 0
+}
+
+# ---------------------------------------------------------------- args
+while (( $# )); do
+  case $1 in
+    --json)         JSON=1 ;;
+    --explain)      EXPLAIN=1 ;;
+    --no-color)     COLOR=0; BOLD=""; DIM=""; RST="" ;;
+    --no-service)   PROBE_ITEMS=0 ;;
+    --only)         ONLY=1 ;;
+    --show-account) SHOW_ACCOUNT=1 ;;
+    --self-test)    SELFTEST=1 ;;
+    --version)      print -r -- "keyprompt $VERSION"; exit 0 ;;
+    -h|--help)      usage; exit 0 ;;
+    --service)
+      [[ -n ${2:-} ]] || die "--service needs BIN=SERVICE"
+      EXTRA_PAIRS+=("${2/=/|}"); shift ;;
+    --service=*)    EXTRA_PAIRS+=("${${1#--service=}/=/|}") ;;
+    *)              die "unknown argument: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+if [[ $OSTYPE != darwin* ]]; then
+  die "keyprompt diagnoses macOS keychain prompts; this host is '$OSTYPE'"
+fi
+
+(( SELFTEST )) && { self_test; exit $?; }
+
+# ---------------------------------------------------------------- collect
+typeset -a J
+J=()
+overall=0
+seen_svc=()
+
+(( ONLY )) && PAIRS=()
+for pair in $PAIRS $EXTRA_PAIRS; do
+  parts=(${(s:|:)pair})
+  local_bin=${parts[1]:-}
+  svc=${parts[2]:-$local_bin}
+  note="custom service"
+  [[ ${#parts} -ge 3 ]] && note=${parts[3]}
+  [[ -n $local_bin ]] || continue
+
+  binp=$(whence -p "$local_bin" 2>/dev/null || true)
+  sig=$(sig_of_path "${binp:-/nonexistent/$local_bin}")
+  sp=(${(s:|:)sig})
+  class=${sp[1]:-unknown}; team=${sp[2]:-not set}; ident=${sp[3]:-}
+  v=$(verdict "$class" "$team")
+  vp=(${(s:|:)v})
+  stab=${vp[1]:-unknown}; cause=${vp[2]:-none}; cause_txt=${vp[3]:-}
+
+  item_status="skipped"; acct=""; cdat=""
+  if (( PROBE_ITEMS )); then
+    a=$(item_attrs "$svc")
+    ip=(${(s:|:)a})
+    item_status=${ip[1]:-absent}; acct=${ip[2]:-}; cdat=${(j:|:)ip[3,-1]}
+  fi
+
+  hint=$(fix_hint "$class" "$team" "$svc")
+  [[ $stab == "unstable" ]] && overall=1
+
+  if (( JSON )); then
+    J+=("$(print -r -- "{\"binary\":\"${local_bin}\",\"path\":\"$(print -r -- "${binp:-}")\",\"service\":\"${svc}\",\"item\":\"${item_status}\",\"created\":\"${cdat}\",\"account\":\"$(mask "$acct")\",\"signature_class\":\"${class}\",\"team_id\":\"${team}\",\"identifier\":\"$(print -r -- "${ident}")\",\"stability\":\"${stab}\",\"cause\":\"${cause}\",\"cause_text\":\"$(print -r -- "${cause_txt}")\",\"fix\":\"$(print -r -- "${hint}")\"}")")
+  else
+    print -r -- ""
+    print -r -- "${BOLD}${local_bin}${RST} ${DIM}(${binp:-not found})${RST}"
+    print -r -- "  service   : ${svc} ${DIM}— ${note}${RST}"
+    print -r -- "  item      : ${item_status}${cdat:+ (created ${cdat})}${acct:+ account=$(mask "$acct")}"
+    print -r -- "  signature : ${class} ${DIM}team=${team} id=$(print -r -- "$ident")${RST}"
+    if [[ $stab == "unstable" ]]; then
+      print -r -- "  verdict   : ${BOLD}UNSTABLE${RST} — ${cause_txt}"
+    else
+      print -r -- "  verdict   : ${stab} — ${cause_txt}"
+    fi
+    print -r -- "  fix       : ${hint}"
+  fi
+done
+
+if (( JSON )); then
+  print -r -- "{\"tool\":\"keyprompt\",\"version\":\"${VERSION}\",\"macos\":\"${MACOS_VER}\",\"read_only\":true,\"results\":["
+  n=0
+  for rec in $J; do
+    n=$((n + 1))
+    print -r -- "$rec$([[ $n -lt ${#J} ]] && print -n ,)"
+  done
+  print -r -- "]}"
+else
+  if (( EXPLAIN )); then
+    cat <<'EOF'
+
+MECHANISM
+  A keychain item carries a partition list: the set of signing identities allowed to
+  read it without asking. macOS writes the *current* identity of the writer there —
+  teamid:<TEAM> for a Developer ID build, or the raw cdhash for an ad-hoc build.
+  An ad-hoc/linker-signed binary (typical for Homebrew or npm shims) gets a new
+  cdhash on every rebuild, so the trust written yesterday no longer matches today's
+  binary and the prompt comes back. Two different teams writing the same item (for
+  example a GitHub-built and a Microsoft-built CLI) cause the same loop without any
+  rebuild happening at all.
+
+  keyprompt cannot read the stored partition list: that requires decrypting the item,
+  which requires the password you are trying not to type. So it reports the signature
+  class as evidence and names the most likely cause instead of claiming certainty.
+EOF
+  fi
+  print -r -- ""
+  if (( overall )); then
+    print -r -- "${BOLD}Summary${RST}: at least one keychain consumer has an unstable signature — a repeating prompt is expected."
+    print -r -- "${DIM}Nothing was modified. keyprompt is read-only.${RST}"
+  else
+    print -r -- "${BOLD}Summary${RST}: no unstable signature found among the checked consumers."
+    print -r -- "${DIM}Nothing was modified. keyprompt is read-only.${RST}"
+  fi
+fi
+
+exit $overall
